@@ -2,17 +2,16 @@ import { useState, useEffect, useRef } from "react";
 import { supabase } from "./supabase";
 
 const MT_TO_LB = 2204.62;
-const MT_TO_L  = 1000; // approximate for palm oil (density ~0.9, but 1 MT = ~1111L; use user-entered density? Keep simple: just show $/L entered)
-const TERMS = ["FOB", "CFR", "CIF", "Delivered"];
+const TERMS    = ["FOB", "CFR", "CIF", "Delivered"];
 const STATUSES = ["Pending", "Accepted", "Rejected", "Countered", "Expired"];
-const UNITS = ["$/MT", "$/lb", "$/liter"];
+const UNITS    = ["BMD+spread", "$/lb", "$/liter"];
 
 const STATUS_CFG = {
-  Pending:   { bg: "#fff8e6", color: "#92640a", border: "#fcd98a" },
-  Accepted:  { bg: "#e6f9ee", color: "#166534", border: "#86efac" },
-  Rejected:  { bg: "#fef2f2", color: "#991b1b", border: "#fca5a5" },
-  Countered: { bg: "#f0edff", color: "#4c1d95", border: "#c4b5fd" },
-  Expired:   { bg: "#f3f4f6", color: "#6b7280", border: "#d1d5db" },
+  Pending:   { bg: "#fff8e6", color: "#92640a",  border: "#fcd98a" },
+  Accepted:  { bg: "#e6f9ee", color: "#166534",  border: "#86efac" },
+  Rejected:  { bg: "#fef2f2", color: "#991b1b",  border: "#fca5a5" },
+  Countered: { bg: "#f0edff", color: "#4c1d95",  border: "#c4b5fd" },
+  Expired:   { bg: "#f3f4f6", color: "#6b7280",  border: "#d1d5db" },
 };
 const TERMS_CFG = {
   FOB:       { bg: "#eff6ff", color: "#1d4ed8", border: "#bfdbfe" },
@@ -25,37 +24,55 @@ function fmt(n, d = 2) {
   if (n == null || n === "" || isNaN(Number(n))) return "";
   return Number(n).toFixed(d);
 }
-
-// Convert any unit to $/MT for cross-unit display
-function toMT(value, unit) {
-  const v = parseFloat(value);
-  if (isNaN(v)) return null;
-  if (unit === "$/MT") return v;
-  if (unit === "$/lb") return v * MT_TO_LB;
-  if (unit === "$/liter") return null; // can't reliably convert without density
-  return null;
-}
-function toLB(value, unit) {
-  const v = parseFloat(value);
-  if (isNaN(v)) return null;
-  if (unit === "$/lb") return v;
-  if (unit === "$/MT") return v / MT_TO_LB;
-  if (unit === "$/liter") return null;
-  return null;
-}
-
 function parseBmd(str) {
   if (!str) return { isBmd: false };
   const m = str.trim().toUpperCase().match(/^BMD\s*([+-])\s*(\d+(\.\d+)?)$/);
   if (!m) return { isBmd: false };
   return { isBmd: true, sign: m[1] === "+" ? 1 : -1, spread: parseFloat(m[2]) };
 }
-function calcBmdUsd(bmdUsd, spread, sign) {
+function calcBmdResolved(bmdUsd, spread, sign) {
   const b = parseFloat(bmdUsd);
   if (isNaN(b)) return null;
   return b + sign * spread;
 }
 
+// Given a stored quote + current BMD, return display-ready price info
+function resolvePrice(q, bmdUsd) {
+  // ── BMD-linked ──
+  if (q.is_bmd) {
+    const todayResolved = bmdUsd ? calcBmdResolved(bmdUsd, q.bmd_spread, q.bmd_sign) : null;
+    return {
+      mode: "bmd",
+      spread: `BMD${q.bmd_sign >= 0 ? "+" : "-"}${q.bmd_spread}`,
+      todayResolved,                          // what it resolves to at current BMD
+      acceptedPrice: q.accepted_price || null,// locked-in price at acceptance
+      acceptedDate:  q.accepted_date  || null,
+    };
+  }
+  // ── Fixed price — fall back to legacy fields ──
+  const legacyVal  = q.price_mt  != null ? q.price_mt  : q.price_lb  != null ? q.price_lb  : null;
+  const legacyUnit = q.price_mt  != null ? "$/MT"       : q.price_lb  != null ? "$/lb"       : "$/MT";
+  const val  = q.price_value != null ? parseFloat(q.price_value) : parseFloat(legacyVal);
+  const unit = q.price_unit  || legacyUnit;
+  if (isNaN(val)) return null;
+
+  let mtEquiv = null;
+  if (unit === "$/lb")  mtEquiv = fmt(val * MT_TO_LB, 2);
+  if (unit === "$/MT")  mtEquiv = fmt(val, 2);       // it IS $/MT, show $/lb below
+  let lbEquiv = null;
+  if (unit === "$/MT")  lbEquiv = fmt(val / MT_TO_LB, 4);
+  if (unit === "$/lb")  lbEquiv = null; // primary is $/lb, secondary is $/MT
+
+  return {
+    mode: "fixed",
+    primary: unit === "$/lb" ? fmt(val, 4) : unit === "$/liter" ? fmt(val, 4) : fmt(val, 2),
+    primaryUnit: unit,
+    secondary: unit === "$/MT" ? lbEquiv  : unit === "$/lb" ? fmt(val * MT_TO_LB, 2) : null,
+    secondaryUnit: unit === "$/MT" ? "$/lb" : unit === "$/lb" ? "$/MT" : null,
+  };
+}
+
+// ── Pill ─────────────────────────────────────────────────────────────
 function Pill({ cfg, children, small }) {
   return (
     <span style={{
@@ -68,9 +85,10 @@ function Pill({ cfg, children, small }) {
   );
 }
 
+// ── Combobox ──────────────────────────────────────────────────────────
 function Combobox({ value, onChange, options, placeholder, onAdd }) {
   const [open, setOpen] = useState(false);
-  const [q, setQ] = useState(value || "");
+  const [q, setQ]       = useState(value || "");
   const ref = useRef();
   useEffect(() => setQ(value || ""), [value]);
   useEffect(() => {
@@ -79,7 +97,7 @@ function Combobox({ value, onChange, options, placeholder, onAdd }) {
     return () => document.removeEventListener("mousedown", h);
   }, []);
   const filtered = options.filter(o => o.toLowerCase().includes(q.toLowerCase()));
-  const showAdd = q.trim() && !options.map(o => o.toLowerCase()).includes(q.trim().toLowerCase());
+  const showAdd  = q.trim() && !options.map(o => o.toLowerCase()).includes(q.trim().toLowerCase());
   function pick(v) { onChange(v); setQ(v); setOpen(false); }
   return (
     <div ref={ref} style={{ position: "relative", width: "100%" }}>
@@ -107,40 +125,135 @@ function Combobox({ value, onChange, options, placeholder, onAdd }) {
 }
 
 function emptyForm() {
-  return { date: new Date().toISOString().split("T")[0], buyer: "", product: "", terms: "FOB", price: "", unit: "$/MT", notes: "", status: "Pending" };
+  return {
+    date: new Date().toISOString().split("T")[0],
+    buyer: "", product: "", terms: "FOB",
+    unit: "BMD+spread", spread: "", fixedPrice: "",
+    notes: "", status: "Pending",
+  };
 }
 
-// Resolve what to display for a quote's price
-function resolvePrice(q, bmdUsd) {
-  if (q.is_bmd) {
-    const resolved = bmdUsd ? calcBmdUsd(bmdUsd, q.bmd_spread, q.bmd_sign) : null;
-    return {
-      primary: q.price_mt_raw,           // "BMD+250"
-      primaryUnit: "$/MT",
-      resolved: resolved,
-      resolvedUnit: "$/MT",
-      secondary: resolved ? fmt(resolved / MT_TO_LB, 4) : null,
-      secondaryUnit: "$/lb",
-      isBmd: true,
-    };
+// ── Accept Modal ──────────────────────────────────────────────────────
+function AcceptModal({ quote, bmdUsd, onConfirm, onCancel }) {
+  const p = resolvePrice(quote, bmdUsd);
+  const suggested = p?.mode === "bmd" ? (p.todayResolved ? fmt(p.todayResolved) : "") : (p?.primary || "");
+  const suggestedUnit = p?.mode === "bmd" ? "$/MT" : p?.primaryUnit;
+  const [price, setPrice] = useState(suggested);
+  const [unit,  setUnit]  = useState(suggestedUnit || "$/MT");
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", zIndex: 500, display: "flex", alignItems: "center", justifyContent: "center", padding: "20px" }}>
+      <div style={{ background: "#fff", borderRadius: "12px", padding: "28px", width: "100%", maxWidth: "400px", boxShadow: "0 20px 60px rgba(0,0,0,0.2)" }}>
+        <div style={{ fontSize: "16px", fontWeight: 700, color: "#111827", marginBottom: "6px" }}>Confirm Accepted Price</div>
+        <div style={{ fontSize: "13px", color: "#6b7280", marginBottom: "20px" }}>
+          Lock in the final agreed price for <strong>{quote.buyer}</strong>. This will be saved alongside the original quote terms.
+        </div>
+
+        {p?.mode === "bmd" && (
+          <div style={{ background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: "8px", padding: "10px 14px", marginBottom: "16px", fontSize: "13px", color: "#374151" }}>
+            Quote: <strong>{p.spread}</strong>
+            {p.todayResolved && <span style={{ color: "#6b7280" }}> · resolves to <strong>${fmt(p.todayResolved)}/MT</strong> at current BMD</span>}
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: "10px", marginBottom: "20px" }}>
+          <div className="form-field" style={{ flex: 2 }}>
+            <label>Final Price</label>
+            <input className="field-input" value={price} onChange={e => setPrice(e.target.value)} placeholder="0.00" autoFocus />
+          </div>
+          <div className="form-field" style={{ flex: 1 }}>
+            <label>Unit</label>
+            <select className="field-input" value={unit} onChange={e => setUnit(e.target.value)}>
+              <option>$/MT</option><option>$/lb</option><option>$/liter</option>
+            </select>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: "10px" }}>
+          <button onClick={() => onConfirm(parseFloat(price), unit)}
+            disabled={!price || isNaN(parseFloat(price))}
+            style={{ flex: 1, background: !price || isNaN(parseFloat(price)) ? "#e5e7eb" : "#166534", color: !price || isNaN(parseFloat(price)) ? "#9ca3af" : "#fff", border: "none", padding: "11px", borderRadius: "8px", fontSize: "14px", fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>
+            Confirm Accepted
+          </button>
+          <button onClick={onCancel}
+            style={{ background: "#f3f4f6", color: "#6b7280", border: "none", padding: "11px 20px", borderRadius: "8px", fontSize: "14px", cursor: "pointer", fontFamily: "inherit" }}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Price Display ─────────────────────────────────────────────────────
+function PriceDisplay({ q, bmdUsd, size = "normal" }) {
+  const p = resolvePrice(q, bmdUsd);
+  if (!p) return <span style={{ color: "#d1d5db" }}>—</span>;
+
+  const big = size === "big";
+  const heroSz  = big ? "16px" : "14px";
+  const subSz   = big ? "12px" : "11px";
+
+  if (p.mode === "bmd") {
+    const accepted = q.status === "Accepted" && p.acceptedPrice;
+    return (
+      <div>
+        {/* Spread — always the hero */}
+        <div style={{ fontWeight: 700, fontSize: heroSz, color: "#111827", fontVariantNumeric: "tabular-nums" }}>
+          {p.spread}
+        </div>
+        {/* Today's resolved value */}
+        {p.todayResolved != null && !accepted && (
+          <div style={{ fontSize: subSz, color: "#9ca3af", marginTop: "2px" }}>
+            = ${fmt(p.todayResolved)}/MT today · ${fmt(p.todayResolved / MT_TO_LB, 4)}/lb
+          </div>
+        )}
+        {!p.todayResolved && !accepted && (
+          <div style={{ fontSize: subSz, color: "#d1d5db", marginTop: "2px" }}>set BMD to resolve</div>
+        )}
+        {/* Accepted: show locked price + drift */}
+        {accepted && (
+          <div style={{ marginTop: "3px" }}>
+            <div style={{ fontSize: subSz, color: "#166534", fontWeight: 600 }}>
+              Locked ${fmt(p.acceptedPrice)} {q.accepted_unit || "$/MT"} on {p.acceptedDate}
+            </div>
+            {p.todayResolved != null && (
+              <div style={{ fontSize: subSz, color: "#9ca3af", marginTop: "1px" }}>
+                {(() => {
+                  const diff = p.todayResolved - p.acceptedPrice;
+                  const sign = diff >= 0 ? "+" : "";
+                  return `Today: $${fmt(p.todayResolved)}/MT (${sign}${fmt(diff)} vs locked)`;
+                })()}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    );
   }
-  const v = parseFloat(q.price_value);
-  const unit = q.price_unit || "$/MT";
-  if (isNaN(v)) return null;
 
-  let secondary = null, secondaryUnit = null;
-  if (unit === "$/MT") { secondary = fmt(v / MT_TO_LB, 4); secondaryUnit = "$/lb"; }
-  if (unit === "$/lb") { secondary = fmt(v * MT_TO_LB, 2); secondaryUnit = "$/MT"; }
-  // $/liter: just show as-is, no reliable conversion
-
-  return { primary: fmt(v, unit === "$/lb" ? 4 : 2), primaryUnit: unit, secondary, secondaryUnit, isBmd: false };
+  // Fixed price
+  return (
+    <div>
+      <div style={{ fontWeight: 700, fontSize: heroSz, color: "#111827", fontVariantNumeric: "tabular-nums" }}>
+        ${p.primary} <span style={{ fontWeight: 400, fontSize: subSz, color: "#9ca3af" }}>{p.primaryUnit}</span>
+      </div>
+      {p.secondary && (
+        <div style={{ fontSize: subSz, color: "#9ca3af", marginTop: "2px", fontVariantNumeric: "tabular-nums" }}>
+          = ${p.secondary} {p.secondaryUnit}
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ── Quote Form ────────────────────────────────────────────────────────
 function QuoteForm({ form, setForm, onSubmit, onCancel, saving, editId, bmdUsd, allBuyers, allProds, onAddBuyer, onAddProduct }) {
-  const formBmd = parseBmd(form.price);
-  const formBmdUsd = formBmd.isBmd && bmdUsd ? calcBmdUsd(bmdUsd, formBmd.spread, formBmd.sign) : null;
-  const canSubmit = form.buyer.trim() && form.price.trim();
+  const isBmd    = form.unit === "BMD+spread";
+  const bmdParsed = isBmd ? parseBmd(`BMD+${form.spread}`) : { isBmd: false };
+  const preview   = isBmd && bmdParsed.isBmd && bmdUsd
+    ? calcBmdResolved(bmdUsd, bmdParsed.spread, bmdParsed.sign) : null;
+  const canSubmit = form.buyer.trim() && (isBmd ? form.spread.trim() : form.fixedPrice.trim());
 
   return (
     <div className="form-panel">
@@ -173,37 +286,54 @@ function QuoteForm({ form, setForm, onSubmit, onCancel, saving, editId, bmdUsd, 
           </select>
         </div>
         <div className="form-field">
-          <label>Unit</label>
-          <select className="field-input" value={form.unit} onChange={e => setForm(f => ({ ...f, unit: e.target.value, price: "" }))}>
+          <label>Quote Type</label>
+          <select className="field-input" value={form.unit} onChange={e => setForm(f => ({ ...f, unit: e.target.value, spread: "", fixedPrice: "" }))}>
             {UNITS.map(u => <option key={u}>{u}</option>)}
           </select>
         </div>
-        <div className="form-field form-full">
-          <label>
-            Price &nbsp;
-            <span style={{ fontWeight: 400, color: "#9ca3af", fontSize: "11px", textTransform: "none" }}>
-              {form.unit === "$/MT" ? "enter $/MT, or type BMD+spread (e.g. BMD+250)" : `enter ${form.unit}`}
-            </span>
-          </label>
-          <input className="field-input" placeholder={form.unit === "$/MT" ? "850.00 or BMD+250" : form.unit === "$/lb" ? "0.3900" : "0.7500"}
-            value={form.price} onChange={e => setForm(f => ({ ...f, price: e.target.value }))} />
-          {/* BMD resolution hint */}
-          {formBmd.isBmd && (
-            <div style={{ marginTop: "5px", fontSize: "12px", color: formBmdUsd ? "#166534" : "#9ca3af" }}>
-              {formBmdUsd ? `= $${fmt(formBmdUsd)} /MT · $${fmt(formBmdUsd / MT_TO_LB, 4)} /lb` : "Set BMD price in header to resolve"}
+
+        {/* BMD spread input */}
+        {isBmd && (
+          <div className="form-field form-full">
+            <label>Spread ($/MT above BMD)</label>
+            <div style={{ display: "flex", alignItems: "center", gap: "0" }}>
+              <div style={{ background: "#f3f4f6", border: "1.5px solid #e5e7eb", borderRight: "none", borderRadius: "8px 0 0 8px", padding: "10px 12px", fontSize: "14px", color: "#6b7280", fontWeight: 600, whiteSpace: "nowrap" }}>BMD +</div>
+              <input className="field-input" style={{ borderRadius: "0 8px 8px 0", borderLeft: "none" }}
+                placeholder="250" value={form.spread}
+                onChange={e => setForm(f => ({ ...f, spread: e.target.value.replace(/[^0-9.]/g, "") }))} />
             </div>
-          )}
-          {/* Live conversion preview */}
-          {!formBmd.isBmd && form.price && !isNaN(parseFloat(form.price)) && form.unit !== "$/liter" && (
-            <div style={{ marginTop: "5px", fontSize: "12px", color: "#6b7280" }}>
-              {form.unit === "$/MT" && `= $${fmt(parseFloat(form.price) / MT_TO_LB, 4)} /lb`}
-              {form.unit === "$/lb" && `= $${fmt(parseFloat(form.price) * MT_TO_LB, 2)} /MT`}
-            </div>
-          )}
-        </div>
+            {preview != null && (
+              <div style={{ marginTop: "6px", fontSize: "12px", color: "#166534", fontWeight: 500 }}>
+                = ${fmt(preview)}/MT · ${fmt(preview / MT_TO_LB, 4)}/lb at current BMD
+              </div>
+            )}
+            {!bmdUsd && form.spread && (
+              <div style={{ marginTop: "6px", fontSize: "12px", color: "#9ca3af" }}>Set BMD price in header to preview resolved value</div>
+            )}
+          </div>
+        )}
+
+        {/* Fixed price input */}
+        {!isBmd && (
+          <div className="form-field form-full">
+            <label>Price ({form.unit})</label>
+            <input className="field-input"
+              placeholder={form.unit === "$/lb" ? "0.3900" : "0.7500"}
+              value={form.fixedPrice}
+              onChange={e => setForm(f => ({ ...f, fixedPrice: e.target.value }))} />
+            {form.fixedPrice && !isNaN(parseFloat(form.fixedPrice)) && (
+              <div style={{ marginTop: "6px", fontSize: "12px", color: "#6b7280" }}>
+                {form.unit === "$/lb"  && `= $${fmt(parseFloat(form.fixedPrice) * MT_TO_LB, 2)}/MT`}
+                {form.unit === "$/MT"  && `= $${fmt(parseFloat(form.fixedPrice) / MT_TO_LB, 4)}/lb`}
+              </div>
+            )}
+          </div>
+        )}
+
         <div className="form-field form-full">
           <label>Notes</label>
-          <input className="field-input" placeholder="Context, comparisons, follow-up…" value={form.notes} onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} />
+          <input className="field-input" placeholder="Context, comparisons, follow-up…" value={form.notes}
+            onChange={e => setForm(f => ({ ...f, notes: e.target.value }))} />
         </div>
       </div>
       <div style={{ display: "flex", gap: "10px", marginTop: "16px" }}>
@@ -219,43 +349,34 @@ function QuoteForm({ form, setForm, onSubmit, onCancel, saving, editId, bmdUsd, 
   );
 }
 
-// ── Price display component ───────────────────────────────────────────
-function PriceDisplay({ q, bmdUsd, size = "normal" }) {
-  const p = resolvePrice(q, bmdUsd);
-  if (!p) return <span style={{ color: "#d1d5db" }}>—</span>;
-  const big = size === "big";
+// ── Summary Bar ───────────────────────────────────────────────────────
+function SummaryBar({ quotes }) {
+  const open = quotes.filter(q => q.status === "Pending" || q.status === "Countered");
+  if (open.length === 0) return null;
+
+  // Group by product
+  const byProduct = {};
+  open.forEach(q => {
+    const key = q.product || "Unspecified";
+    byProduct[key] = (byProduct[key] || 0) + 1;
+  });
+
   return (
-    <div>
-      {p.isBmd ? (
-        <>
-          <div style={{ fontWeight: 700, fontSize: big ? "15px" : "13px", color: "#374151" }}>
-            {p.primary}
-            {p.resolved != null && (
-              <span style={{ fontWeight: 400, color: "#9ca3af", marginLeft: "6px", fontSize: big ? "13px" : "11px" }}>
-                = ${fmt(p.resolved)}/MT
-              </span>
-            )}
-          </div>
-          {p.secondary && <div style={{ fontSize: big ? "12px" : "11px", color: "#9ca3af", marginTop: "1px" }}>${p.secondary}/lb</div>}
-          {!p.resolved && <div style={{ fontSize: "11px", color: "#d1d5db", marginTop: "1px" }}>set BMD to resolve</div>}
-        </>
-      ) : (
-        <>
-          <div style={{ fontWeight: 700, fontSize: big ? "16px" : "14px", color: "#111827", fontVariantNumeric: "tabular-nums" }}>
-            ${p.primary} <span style={{ fontWeight: 400, fontSize: big ? "13px" : "11px", color: "#9ca3af" }}>{p.primaryUnit}</span>
-          </div>
-          {p.secondary && (
-            <div style={{ fontSize: big ? "12px" : "11px", color: "#9ca3af", marginTop: "1px", fontVariantNumeric: "tabular-nums" }}>
-              ${p.secondary} {p.secondaryUnit}
-            </div>
-          )}
-        </>
-      )}
+    <div style={{ background: "#f0f7ff", borderBottom: "1px solid #bfdbfe", padding: "8px 20px", display: "flex", gap: "6px", alignItems: "center", flexWrap: "wrap" }}>
+      <span style={{ fontSize: "11px", fontWeight: 700, color: "#1d4ed8", textTransform: "uppercase", letterSpacing: "0.08em", marginRight: "4px" }}>Open</span>
+      {Object.entries(byProduct).map(([prod, count]) => (
+        <span key={prod} style={{ fontSize: "12px", background: "#fff", border: "1px solid #bfdbfe", color: "#1d4ed8", borderRadius: "20px", padding: "3px 10px", fontWeight: 500 }}>
+          {prod} · {count}
+        </span>
+      ))}
+      <span style={{ fontSize: "11px", color: "#93c5fd", marginLeft: "4px" }}>{open.length} total open</span>
     </div>
   );
 }
 
-// ── Desktop table row ─────────────────────────────────────────────────
+// ── Desktop Table Row ─────────────────────────────────────────────────
+const TABLE_COLS = "96px 1.8fr 80px 1.8fr 130px 1.2fr 70px";
+
 function QuoteRow({ q, bmdUsd, onEdit, onDelete, onStatusChange }) {
   return (
     <div className="quote-row">
@@ -281,7 +402,7 @@ function QuoteRow({ q, bmdUsd, onEdit, onDelete, onStatusChange }) {
   );
 }
 
-// ── Mobile card ───────────────────────────────────────────────────────
+// ── Mobile Card ───────────────────────────────────────────────────────
 function QuoteCard({ q, bmdUsd, onEdit, onDelete, onStatusChange }) {
   return (
     <div style={{ background: "#fff", borderRadius: "10px", border: "1px solid #e5e7eb", padding: "14px 16px", marginBottom: "10px", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" }}>
@@ -313,24 +434,25 @@ function QuoteCard({ q, bmdUsd, onEdit, onDelete, onStatusChange }) {
 
 // ── Main App ──────────────────────────────────────────────────────────
 export default function App() {
-  const [quotes,   setQuotes]   = useState([]);
-  const [buyers,   setBuyers]   = useState([]);
-  const [prods,    setProds]    = useState([]);
-  const [loading,  setLoading]  = useState(true);
-  const [form,     setForm]     = useState(emptyForm());
-  const [editId,   setEditId]   = useState(null);
-  const [showForm, setShowForm] = useState(false);
-  const [saving,   setSaving]   = useState(false);
-  const [tab,      setTab]      = useState("quotes");
-  const [sfStatus, setSfStatus] = useState("All");
-  const [sfBuyer,  setSfBuyer]  = useState("All");
-  const [sfProd,   setSfProd]   = useState("All");
-  const [bmdUsd,   setBmdUsd]   = useState("");
-  const [bmdInput, setBmdInput] = useState("");
-  const [bmdTs,    setBmdTs]    = useState(null);
-  const [showBmd,  setShowBmd]  = useState(false);
-  const [newBuyer, setNewBuyer] = useState("");
-  const [newProd,  setNewProd]  = useState("");
+  const [quotes,      setQuotes]      = useState([]);
+  const [buyers,      setBuyers]      = useState([]);
+  const [prods,       setProds]       = useState([]);
+  const [loading,     setLoading]     = useState(true);
+  const [form,        setForm]        = useState(emptyForm());
+  const [editId,      setEditId]      = useState(null);
+  const [showForm,    setShowForm]    = useState(false);
+  const [saving,      setSaving]      = useState(false);
+  const [tab,         setTab]         = useState("quotes");
+  const [sfStatus,    setSfStatus]    = useState("All");
+  const [sfBuyer,     setSfBuyer]     = useState("All");
+  const [sfProd,      setSfProd]      = useState("All");
+  const [bmdUsd,      setBmdUsd]      = useState("");
+  const [bmdInput,    setBmdInput]    = useState("");
+  const [bmdTs,       setBmdTs]       = useState(null);
+  const [showBmd,     setShowBmd]     = useState(false);
+  const [newBuyer,    setNewBuyer]    = useState("");
+  const [newProd,     setNewProd]     = useState("");
+  const [acceptModal, setAcceptModal] = useState(null); // quote being accepted
 
   useEffect(() => { loadAll(); }, []);
 
@@ -343,18 +465,18 @@ export default function App() {
         supabase.from("products").select("*").order("name"),
         supabase.from("bmd_settings").select("*").eq("id", 1).single(),
       ]);
-      if (q) setQuotes(q);
-      if (b) setBuyers(b.map(x => x.name));
-      if (p) setProds(p.map(x => x.name));
+      if (q)   setQuotes(q);
+      if (b)   setBuyers(b.map(x => x.name));
+      if (p)   setProds(p.map(x => x.name));
       if (bmd) { setBmdUsd(bmd.bmd_myr || ""); setBmdInput(bmd.bmd_myr || ""); setBmdTs(bmd.updated_at || null); }
     } catch (_) {}
     setLoading(false);
   }
 
-  async function addBuyer(name) { if (!name.trim()) return; await supabase.from("buyers").upsert({ name: name.trim() }); setBuyers(b => [...new Set([...b, name.trim()])].sort()); }
-  async function addProduct(name) { if (!name.trim()) return; await supabase.from("products").upsert({ name: name.trim() }); setProds(p => [...new Set([...p, name.trim()])].sort()); }
+  async function addBuyer(name)    { if (!name.trim()) return; await supabase.from("buyers").upsert({ name: name.trim() }); setBuyers(b => [...new Set([...b, name.trim()])].sort()); }
+  async function addProduct(name)  { if (!name.trim()) return; await supabase.from("products").upsert({ name: name.trim() }); setProds(p => [...new Set([...p, name.trim()])].sort()); }
   async function deleteBuyer(name) { await supabase.from("buyers").delete().eq("name", name); setBuyers(b => b.filter(x => x !== name)); }
-  async function deleteProduct(name) { await supabase.from("products").delete().eq("name", name); setProds(p => p.filter(x => x !== name)); }
+  async function deleteProduct(name){ await supabase.from("products").delete().eq("name", name); setProds(p => p.filter(x => x !== name)); }
 
   async function saveBmd() {
     const now = new Date().toISOString();
@@ -363,22 +485,26 @@ export default function App() {
   }
 
   async function submit() {
-    if (!form.buyer.trim() || !form.price.trim()) return;
+    if (!form.buyer.trim()) return;
+    const isBmd = form.unit === "BMD+spread";
+    if (isBmd && !form.spread.trim()) return;
+    if (!isBmd && !form.fixedPrice.trim()) return;
     setSaving(true);
-    const bmd = parseBmd(form.price);
+
+    const spread = isBmd ? parseFloat(form.spread) : null;
     const entry = {
       id: editId || Date.now().toString(),
       buyer: form.buyer, product: form.product, terms: form.terms,
-      price_mt_raw: form.price,
-      price_value: bmd.isBmd ? null : parseFloat(form.price),
-      price_unit: bmd.isBmd ? "$/MT" : form.unit,
-      // legacy fields kept for compatibility
-      price_mt: bmd.isBmd ? null : (form.unit === "$/MT" ? parseFloat(form.price) : null),
-      price_lb: bmd.isBmd ? null : (form.unit === "$/lb" ? parseFloat(form.price) : null),
-      is_bmd: bmd.isBmd,
-      bmd_spread: bmd.isBmd ? bmd.spread : null,
-      bmd_sign: bmd.isBmd ? bmd.sign : null,
       date: form.date, status: form.status, notes: form.notes,
+      is_bmd:      isBmd,
+      bmd_spread:  isBmd ? spread : null,
+      bmd_sign:    isBmd ? 1 : null,           // always BMD+ for now
+      price_mt_raw: isBmd ? `BMD+${form.spread}` : null,
+      price_value: isBmd ? null : parseFloat(form.fixedPrice),
+      price_unit:  isBmd ? null : form.unit,
+      // legacy compat
+      price_mt: (!isBmd && form.unit === "$/MT") ? parseFloat(form.fixedPrice) : null,
+      price_lb: (!isBmd && form.unit === "$/lb") ? parseFloat(form.fixedPrice) : null,
       created_at: editId ? (quotes.find(q => q.id === editId)?.created_at || new Date().toISOString()) : new Date().toISOString(),
     };
     await supabase.from("quotes").upsert(entry);
@@ -388,33 +514,58 @@ export default function App() {
   }
 
   async function patchStatus(id, status) {
+    // If accepting a BMD quote, trigger modal
+    const q = quotes.find(x => x.id === id);
+    if (status === "Accepted") {
+      setAcceptModal({ ...q, pendingStatus: "Accepted" });
+      return;
+    }
     await supabase.from("quotes").update({ status }).eq("id", id);
     setQuotes(qs => qs.map(q => q.id === id ? { ...q, status } : q));
   }
+
+  async function confirmAccept(price, unit) {
+    if (!acceptModal) return;
+    const today = new Date().toISOString().split("T")[0];
+    await supabase.from("quotes").update({
+      status: "Accepted",
+      accepted_price: price,
+      accepted_unit: unit,
+      accepted_date: today,
+    }).eq("id", acceptModal.id);
+    await loadAll();
+    setAcceptModal(null);
+  }
+
   async function deleteQuote(id) {
     await supabase.from("quotes").delete().eq("id", id);
     setQuotes(qs => qs.filter(q => q.id !== id));
   }
 
   function startEdit(q) {
-    // Reconstruct unit from stored data
-    let unit = q.price_unit || (q.price_lb != null && q.price_mt == null ? "$/lb" : "$/MT");
-    let price = q.price_mt_raw || (q.price_value != null ? String(q.price_value) : q.price_mt != null ? String(q.price_mt) : q.price_lb != null ? String(q.price_lb) : "");
-    setForm({ date: q.date, buyer: q.buyer, product: q.product || "", terms: q.terms, price, unit, notes: q.notes || "", status: q.status });
+    const isBmd = q.is_bmd;
+    const legacyVal = q.price_mt != null ? q.price_mt : q.price_lb != null ? q.price_lb : null;
+    const legacyUnit = q.price_mt != null ? "$/MT" : q.price_lb != null ? "$/lb" : "$/MT";
+    setForm({
+      date: q.date, buyer: q.buyer, product: q.product || "",
+      terms: q.terms, status: q.status, notes: q.notes || "",
+      unit: isBmd ? "BMD+spread" : (q.price_unit || legacyUnit),
+      spread: isBmd ? String(q.bmd_spread || "") : "",
+      fixedPrice: !isBmd ? String(q.price_value != null ? q.price_value : legacyVal || "") : "",
+    });
     setEditId(q.id); setShowForm(true); setTab("quotes");
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
   function cancel() { setForm(emptyForm()); setEditId(null); setShowForm(false); }
 
-  function filterByBuyer(name) { setSfBuyer(name); setSfProd("All"); setTab("quotes"); }
-  function filterByProduct(name) { setSfProd(name); setSfBuyer("All"); setTab("quotes"); }
+  function filterByBuyer(name)   { setSfBuyer(name); setSfProd("All");  setTab("quotes"); }
+  function filterByProduct(name) { setSfProd(name);  setSfBuyer("All"); setTab("quotes"); }
 
   const allBuyers = [...new Set([...buyers, ...quotes.map(q => q.buyer)])].filter(Boolean).sort();
   const allProds  = [...new Set([...prods,  ...quotes.map(q => q.product)])].filter(Boolean).sort();
-
-  const filtered = quotes.filter(q =>
+  const filtered  = quotes.filter(q =>
     (sfStatus === "All" || q.status === sfStatus) &&
-    (sfBuyer  === "All" || q.buyer   === sfBuyer) &&
+    (sfBuyer  === "All" || q.buyer   === sfBuyer)  &&
     (sfProd   === "All" || q.product === sfProd)
   );
   const counts = Object.fromEntries(STATUSES.map(s => [s, quotes.filter(q => q.status === s).length]));
@@ -423,8 +574,6 @@ export default function App() {
     if (!iso) return "";
     return new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
   }
-
-  const TABLE_COLS = "96px 1.8fr 80px 1.6fr 130px 1.4fr 70px";
 
   return (
     <div style={{ minHeight: "100vh", background: "#f3f4f6", fontFamily: "'Outfit', sans-serif", color: "#111827" }}>
@@ -436,7 +585,6 @@ export default function App() {
         ::-webkit-scrollbar { width: 4px; height: 4px; }
         ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 2px; }
         input[type=date]::-webkit-calendar-picker-indicator { cursor: pointer; opacity: 0.5; }
-
         .field-input {
           width: 100%; background: #fff; border: 1.5px solid #e5e7eb;
           border-radius: 8px; color: #111827; padding: 10px 12px;
@@ -451,39 +599,28 @@ export default function App() {
         .form-panel { padding: 20px 24px; background: #fff; border-bottom: 2px solid #e8f0fe; }
         .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 20px; }
         .form-full { grid-column: 1 / -1; }
-
-        /* Desktop table */
         .quote-table { display: block; background: #fff; }
         .quote-cards { display: none; padding: 14px; }
-
         .quote-row {
           display: grid; grid-template-columns: ${TABLE_COLS};
-          padding: 0 20px; min-height: 52px; align-items: center;
+          padding: 0 20px; min-height: 56px; align-items: center;
           border-bottom: 1px solid #f3f4f6; transition: background 0.1s; background: #fff;
         }
         .quote-row:hover { background: #f8faff; }
         .qcol { padding: 10px 8px; }
         .date-col { font-size: 12px; color: #9ca3af; font-variant-numeric: tabular-nums; }
         .notes-col { font-size: 12px; color: #6b7280; font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
         .action-col { display: flex; gap: 5px; justify-content: flex-end; opacity: 0; transition: opacity 0.15s; }
         .quote-row:hover .action-col { opacity: 1; }
         .action-btn { width: 28px; height: 28px; border: none; border-radius: 6px; cursor: pointer; font-size: 12px; display: flex; align-items: center; justify-content: center; font-family: inherit; }
         .edit-btn { background: #eff6ff; color: #2563eb; }
         .del-btn  { background: #fef2f2; color: #dc2626; }
-
-        .add-row {
-          display: flex; align-items: center; gap: 8px; padding: 13px 28px;
-          color: #d1d5db; font-size: 13px; cursor: pointer;
-          border-bottom: 1px solid #f3f4f6; background: #fff; transition: all 0.15s;
-        }
+        .add-row { display: flex; align-items: center; gap: 8px; padding: 13px 28px; color: #d1d5db; font-size: 13px; cursor: pointer; border-bottom: 1px solid #f3f4f6; background: #fff; transition: all 0.15s; }
         .add-row:hover { color: #0073ea; background: #f0f7ff; }
-
         .list-row { transition: background 0.1s; }
         .list-row:hover { background: #f9fafb; }
-        .clickable-name { cursor: pointer; color: #111827; transition: color 0.12s; }
+        .clickable-name { cursor: pointer; transition: color 0.12s; }
         .clickable-name:hover { color: #0073ea; text-decoration: underline; }
-
         @media (max-width: 768px) {
           .quote-table { display: none; }
           .quote-cards { display: block; }
@@ -492,6 +629,13 @@ export default function App() {
           .form-panel { padding: 16px; }
         }
       `}</style>
+
+      {/* Accept Modal */}
+      {acceptModal && (
+        <AcceptModal quote={acceptModal} bmdUsd={bmdUsd}
+          onConfirm={confirmAccept}
+          onCancel={() => setAcceptModal(null)} />
+      )}
 
       {/* ── Nav ── */}
       <div style={{ background: "#1e1b4b", padding: "0 20px", position: "sticky", top: 0, zIndex: 50 }}>
@@ -533,7 +677,7 @@ export default function App() {
       {/* ── Content ── */}
       <div style={{ maxWidth: "1280px", margin: "0 auto" }}>
 
-        {/* ── Tabs ── */}
+        {/* Tabs */}
         <div style={{ background: "#fff", borderBottom: "1px solid #e5e7eb", display: "flex", padding: "0 20px" }}>
           {[["quotes", "Quotes"], ["buyers", "Buyers"], ["products", "Products"]].map(([key, label]) => (
             <button key={key} onClick={() => { setTab(key); cancel(); }}
@@ -567,20 +711,20 @@ export default function App() {
                   );
                 })}
               </div>
-              {/* Active filter chips */}
               {sfBuyer !== "All" && (
                 <div style={{ display: "flex", alignItems: "center", gap: "6px", background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: "20px", padding: "5px 12px", fontSize: "12px", color: "#1d4ed8", fontWeight: 500, flexShrink: 0 }}>
-                  {sfBuyer}
-                  <span onClick={() => setSfBuyer("All")} style={{ cursor: "pointer", opacity: 0.6, marginLeft: "2px" }}>✕</span>
+                  {sfBuyer} <span onClick={() => setSfBuyer("All")} style={{ cursor: "pointer", opacity: 0.6 }}>✕</span>
                 </div>
               )}
               {sfProd !== "All" && (
                 <div style={{ display: "flex", alignItems: "center", gap: "6px", background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: "20px", padding: "5px 12px", fontSize: "12px", color: "#15803d", fontWeight: 500, flexShrink: 0 }}>
-                  {sfProd}
-                  <span onClick={() => setSfProd("All")} style={{ cursor: "pointer", opacity: 0.6, marginLeft: "2px" }}>✕</span>
+                  {sfProd} <span onClick={() => setSfProd("All")} style={{ cursor: "pointer", opacity: 0.6 }}>✕</span>
                 </div>
               )}
             </div>
+
+            {/* Summary bar */}
+            <SummaryBar quotes={quotes} />
 
             {/* Form */}
             {showForm && (
@@ -643,18 +787,18 @@ export default function App() {
                 </button>
               </div>
               {buyers.length === 0
-                ? <div style={{ padding: "40px", textAlign: "center", color: "#9ca3af", fontSize: "14px" }}>No buyers yet</div>
+                ? <div style={{ padding: "40px", textAlign: "center", color: "#9ca3af" }}>No buyers yet</div>
                 : buyers.map(b => {
-                  const qCount = quotes.filter(q => q.buyer === b).length;
+                  const qc = quotes.filter(q => q.buyer === b).length;
                   return (
                     <div key={b} className="list-row" style={{ padding: "13px 16px", borderBottom: "1px solid #f9fafb", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                       <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                        <span className="clickable-name" style={{ fontSize: "14px", fontWeight: 500 }} onClick={() => filterByBuyer(b)}>{b}</span>
-                        {qCount > 0 && <span style={{ fontSize: "11px", color: "#9ca3af", background: "#f3f4f6", padding: "1px 7px", borderRadius: "20px", fontWeight: 500 }}>{qCount} quote{qCount !== 1 ? "s" : ""}</span>}
+                        <span className="clickable-name" style={{ fontSize: "14px", fontWeight: 500, color: "#111827" }} onClick={() => filterByBuyer(b)}>{b}</span>
+                        {qc > 0 && <span style={{ fontSize: "11px", color: "#9ca3af", background: "#f3f4f6", padding: "1px 7px", borderRadius: "20px" }}>{qc} quote{qc !== 1 ? "s" : ""}</span>}
                       </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
                         <span onClick={() => filterByBuyer(b)} style={{ fontSize: "12px", color: "#0073ea", cursor: "pointer", fontWeight: 500 }}>View quotes →</span>
-                        <button onClick={() => deleteBuyer(b)} style={{ background: "none", border: "none", color: "#d1d5db", cursor: "pointer", fontSize: "16px", padding: "0 4px" }}>✕</button>
+                        <button onClick={() => deleteBuyer(b)} style={{ background: "none", border: "none", color: "#d1d5db", cursor: "pointer", fontSize: "16px" }}>✕</button>
                       </div>
                     </div>
                   );
@@ -677,18 +821,18 @@ export default function App() {
                 </button>
               </div>
               {prods.length === 0
-                ? <div style={{ padding: "40px", textAlign: "center", color: "#9ca3af", fontSize: "14px" }}>No products yet</div>
+                ? <div style={{ padding: "40px", textAlign: "center", color: "#9ca3af" }}>No products yet</div>
                 : prods.map(p => {
-                  const qCount = quotes.filter(q => q.product === p).length;
+                  const qc = quotes.filter(q => q.product === p).length;
                   return (
                     <div key={p} className="list-row" style={{ padding: "13px 16px", borderBottom: "1px solid #f9fafb", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                       <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                        <span className="clickable-name" style={{ fontSize: "14px", fontWeight: 500 }} onClick={() => filterByProduct(p)}>{p}</span>
-                        {qCount > 0 && <span style={{ fontSize: "11px", color: "#9ca3af", background: "#f3f4f6", padding: "1px 7px", borderRadius: "20px", fontWeight: 500 }}>{qCount} quote{qCount !== 1 ? "s" : ""}</span>}
+                        <span className="clickable-name" style={{ fontSize: "14px", fontWeight: 500, color: "#111827" }} onClick={() => filterByProduct(p)}>{p}</span>
+                        {qc > 0 && <span style={{ fontSize: "11px", color: "#9ca3af", background: "#f3f4f6", padding: "1px 7px", borderRadius: "20px" }}>{qc} quote{qc !== 1 ? "s" : ""}</span>}
                       </div>
-                      <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
                         <span onClick={() => filterByProduct(p)} style={{ fontSize: "12px", color: "#0073ea", cursor: "pointer", fontWeight: 500 }}>View quotes →</span>
-                        <button onClick={() => deleteProduct(p)} style={{ background: "none", border: "none", color: "#d1d5db", cursor: "pointer", fontSize: "16px", padding: "0 4px" }}>✕</button>
+                        <button onClick={() => deleteProduct(p)} style={{ background: "none", border: "none", color: "#d1d5db", cursor: "pointer", fontSize: "16px" }}>✕</button>
                       </div>
                     </div>
                   );
