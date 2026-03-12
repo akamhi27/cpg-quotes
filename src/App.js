@@ -493,7 +493,7 @@ export default function App() {
 
     const spread = isBmd ? parseFloat(form.spread) : null;
     const entry = {
-      id: editId || Date.now().toString(),
+      ...(editId ? { id: editId } : {}),
       buyer: form.buyer, product: form.product, terms: form.terms,
       date: form.date, status: form.status, notes: form.notes,
       is_bmd:      isBmd,
@@ -507,7 +507,10 @@ export default function App() {
       price_lb: (!isBmd && form.unit === "$/lb") ? parseFloat(form.fixedPrice) : null,
       created_at: editId ? (quotes.find(q => q.id === editId)?.created_at || new Date().toISOString()) : new Date().toISOString(),
     };
-    await supabase.from("quotes").upsert(entry);
+    const { error } = editId
+      ? await supabase.from("quotes").update(entry).eq("id", editId)
+      : await supabase.from("quotes").insert(entry);
+    if (error) { alert("Save failed: " + error.message); setSaving(false); return; }
     if (!buyers.includes(form.buyer.trim())) await addBuyer(form.buyer.trim());
     await loadAll();
     setSaving(false); setForm(emptyForm()); setEditId(null); setShowForm(false);
