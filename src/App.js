@@ -507,6 +507,7 @@ export default function App() {
       price_lb: (!isBmd && form.unit === "$/lb") ? parseFloat(form.fixedPrice) : null,
       created_at: editId ? (quotes.find(q => q.id === editId)?.created_at || new Date().toISOString()) : new Date().toISOString(),
     };
+    if (!editId) entry.id = crypto.randomUUID();
     const { error } = editId
       ? await supabase.from("quotes").update(entry).eq("id", editId)
       : await supabase.from("quotes").insert(entry);
